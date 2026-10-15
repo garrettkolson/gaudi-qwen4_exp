@@ -1,0 +1,330 @@
+{
+  "title": "Roadmap: Qwen3.8-Flash-Next (qwen4_exp) serving on Gaudi 2 via vllm-gaudi",
+  "schema_version": "1.1",
+  "generated_for": "agent-execution",
+  "target_stack": {
+    "gaudi_software_suite": "1.24.2",
+    "pytorch": "2.13",
+    "vllm_gaudi_plugin": "0.30.0",
+    "upstream_vllm": "0.30.0 (pin at/after c05d75a)",
+    "hardware": "4x Gaudi 2",
+    "gaudi2_hbm": "96 GB HBM2E @ 2.45 TB/s per card",
+    "gaudi2_fp8_support": [
+      "E4M3",
+      "E5M2"
+    ],
+    "reference_port_source": "vllm-gaudi PR #1829 (Gaudi 3, eager-only)"
+  },
+  "execution_model": {
+    "recommended_order": [
+      "P0",
+      "P1",
+      "P4_pin_check",
+      "P3",
+      "P4_capture",
+      "P5"
+    ],
+    "note": "Do the cheap P4 pin check before investing heavy kernel authoring in P3.",
+    "gating_phase": "P0"
+  },
+  "phases": [
+    {
+      "id": "P0",
+      "title": "Platform feasibility & memory planning (Gaudi-2 gate)",
+      "goal": "Confirm FP8 is a real runtime path on Gaudi 2 and size HBM/TP correctly.",
+      "is_gating": true,
+      "depends_on": [],
+      "tasks": [
+        {
+          "id": "P0.1",
+          "desc": "Load Qwen3.8-Flash-Next-FP8 checkpoint on Gaudi 2 eager; FP8 E4M3/E5M2 is supported, so no re-quantization fork."
+        },
+        {
+          "id": "P0.2",
+          "desc": "Benchmark FP8 MME throughput/maturity on Gaudi 2 vs Gaudi 3 (Gaudi 3 headline 1.8 PFlops FP8; Gaudi 2 lists FP8 without matching PFlops)."
+        },
+        {
+          "id": "P0.3",
+          "desc": "Re-derive TP degree, --max-model-len, --gpu-memory-utilization for Gaudi 2's 96GB/2.45TB/s (vs PR's Gaudi 3 128GB/3.7TB/s, 0.80 util)."
+        },
+        {
+          "id": "P0.4",
+          "desc": "Set required flags: --kv-cache-dtype auto, VLLM_SKIP_WARMUP=true, --enforce-eager, --language-model-only."
+        },
+        {
+          "id": "P0.5",
+          "desc": "Benchmark HCCL inter-collective bandwidth (allreduce/allgather/all2all) on the Gaudi 2 fabric via HCCL Testing/Benchmarking, BEFORE fixing a TP/EP topology. Rationale: EP (expert-parallel) for MoE is an all-to-all dispatch/combine pattern; feasibility depends on measured all2all throughput, not primitive existence. Gaudi 2: 2.4 TB/s HBM, on-chip 24x100 Gbps RoCE."
+        }
+      ],
+      "exit_criteria": [
+        "FP8 checkpoint loads and produces deterministic single-token probes on Gaudi 2 eager.",
+        "A TP + max-model-len + memory-util config fits without OOM.",
+        "Measured allreduce/allgather/all2all bandwidth recorded; TP/EP target chosen from measured numbers."
+      ]
+    },
+    {
+      "id": "P1",
+      "title": "Reuse PR #1829, retarget to Gaudi 2 / plugin 0.30.0",
+      "goal": "Correct eager forward via reuse, not re-derivation.",
+      "depends_on": [
+        "P0"
+      ],
+      "tasks": [
+        {
+          "id": "P1.1",
+          "desc": "Base on vllm_gaudi/models/qwen4_exp.py (~2.4k lines): GDN (reuse HPUGatedDeltaNetAttention, 48V/16QK/128), QSA (HpuQSAIndexer+HpuQwen4ExpQSAAttention), PLE (HpuQwen4ExpPLENorm+HpuQwen4ExpNGramEmbedding), HyperConnection (HpuGatedResidual)."
+        },
+        {
+          "id": "P1.2",
+          "desc": "Register Qwen4ExpForCausalLM + Qwen4ExpForConditionalGeneration via ModelRegistry.register_model; add arch to maybe_set_mamba_kv_cache_groups_ids in hpu_model_runner.py."
+        },
+        {
+          "id": "P1.3",
+          "desc": "Retarget from PR pin dd3bc9c72faf to plugin 0.30.0 stable pin (satisfies c05d75a+)."
+        },
+        {
+          "id": "P1.4",
+          "desc": "Carry fp8 MoE block-grid fix (_effective_moe_block_size) from extension/ops.py."
+        },
+        {
+          "id": "P1.5",
+          "desc": "Honor modules_to_not_convert; drop mtp.* head at load."
+        }
+      ],
+      "exit_criteria": [
+        "PR smoke battery (arithmetic, geography, code, needle retrieval) reproduces on Gaudi 2."
+      ]
+    },
+    {
+      "id": "P2",
+      "title": "Cache & memory plumbing (HBM fit + prefix caching)",
+      "goal": "Stable under concurrency; correct prefix-cache semantics.",
+      "depends_on": [
+        "P1"
+      ],
+      "tasks": [
+        {
+          "id": "P2.1",
+          "desc": "Migrate QSA raw-key ring + compressed-key side cache + PLE dilated-conv state + n-gram trailing-token history from module-allocated per-state-slot buffers to scheduler-owned KV blocks (PR's tracked follow-up; more urgent on smaller Gaudi 2 HBM)."
+        },
+        {
+          "id": "P2.2",
+          "desc": "Keep prefix caching OFF until P2.1 lands (hybrid default on HPU)."
+        },
+        {
+          "id": "P2.3",
+          "desc": "Confirm decode block buckets clamped to physical KV cache size (plugin v0.30.0 feature) is active."
+        }
+      ],
+      "exit_criteria": [
+        "Stable at concurrency 8+ without side-cache OOM; prefix cache correctness restored after P2.1."
+      ]
+    },
+    {
+      "id": "P3",
+      "title": "Custom kernels for three hard primitives (CustomOp/TPC)",
+      "goal": "Replace eager fallbacks with fused TPC kernels; in your control, not Intel-gated.",
+      "depends_on": [
+        "P1"
+      ],
+      "primitives": [
+        {
+          "id": "P3.sparse_topk",
+          "name": "Sparse top-k gather / QSA indexer",
+          "graph_capture_risk": "high (data-dependent control flow)"
+        },
+        {
+          "id": "P3.ple_conv",
+          "name": "PLE dilated short-conv",
+          "graph_capture_risk": "medium"
+        },
+        {
+          "id": "P3.ple_ngram_fp8",
+          "name": "FP8 n-gram gather-then-dequant",
+          "graph_capture_risk": "medium",
+          "dtype_note": "stays FP8 on Gaudi 2 MME; no INT8 re-expression"
+        }
+      ],
+      "integration_contract": {
+        "path": "PyTorch CustomOp API + TPC SDK",
+        "steps": [
+          "Write kernel body in TPC-C via TPC SDK (same path Intel uses for its own kernels).",
+          "registerUserCustomOp(schema, tpc_guid, OutputMetaFn, optional FillParamsFn); types in hpu_custom_op_pt2.h.",
+          "Build execution fn via getUserCustomOpDescriptor + execute.",
+          "Define op with TORCH_LIBRARY; HPU dispatch via TORCH_LIBRARY_IMPL; add Meta impl for torch.compile.",
+          "Compile op.cpp against habana_pytorch2_plugin; load with torch.ops.load_library."
+        ],
+        "hard_limits": [
+          "Single TPC kernel per UserCustomOpDescriptor; multi-op Python decomposition recreates eager dispatch cost.",
+          "Must register in custom_op namespace for full torch.compile support (gates P4 capture)."
+        ]
+      },
+      "exit_criteria": [
+        "Each primitive is a single CustomOp, byte-equal to eager reference on Gaudi 2; per-step dispatch count drops vs eager."
+      ]
+    },
+    {
+      "id": "P4_pin_check",
+      "title": "Cheap graph-capture win (do before heavy P3)",
+      "goal": "Determine if the upstream pin alone unblocks compiled mode for GDN/HyperConnection.",
+      "depends_on": [
+        "P1"
+      ],
+      "tasks": [
+        {
+          "id": "P4.1",
+          "desc": "Verify build pin is at/after c05d75a (Keep Qwen3Next layer boundaries sequence parallel) \u2014 resolved synStatus-26 #1734 for GDN hybrids with NO plugin change."
+        },
+        {
+          "id": "P4.2",
+          "desc": "Test boot without --enforce-eager on Gaudi 2; capture which subgraphs still fail."
+        }
+      ],
+      "exit_criteria": [
+        "Documented list of remaining capture-failing subgraphs after the pin fix."
+      ]
+    },
+    {
+      "id": "P4_capture",
+      "title": "Compiled (HPU-graph) mode: off eager-only",
+      "goal": "Serve with --enforce-eager removed, or hybrid compiled+eager.",
+      "depends_on": [
+        "P4_pin_check",
+        "P3"
+      ],
+      "tasks": [
+        {
+          "id": "P4.3",
+          "desc": "Integrate PR #1843 mitigations: DS=0 concrete-plan recipe, host-side decode count fix, bmm score contraction fix, flat index_copy_ store rewrite (restores first-request survival)."
+        },
+        {
+          "id": "P4.4",
+          "desc": "Eliminate host-coercing ops in QSA/PLE hot paths: .nonzero (PLE _pool_and_store), .item(), torch.minimum (_expand_plan), keep.any() (KV-store epilogue)."
+        },
+        {
+          "id": "P4.5",
+          "desc": "Ensure each P3 CustomOp satisfies single-kernel + custom_op namespace requirements for capture."
+        }
+      ],
+      "exit_criteria": [
+        "Boots/serves on all TP workers without --enforce-eager, or documented per-subgraph eager fallback for QSA indexer only."
+      ],
+      "known_blocker": "synStatus-26 / synapse compileGraph (issue #1734 family)."
+    },
+    {
+      "id": "P5",
+      "title": "Throughput for Gaudi 2 MoE economics",
+      "goal": "Usable serving speed given issue #1733 on Gaudi 2 low batch.",
+      "depends_on": [
+        "P4_capture",
+        "P2"
+      ],
+      "tasks": [
+        {
+          "id": "P5.1",
+          "desc": "Apply opt-in gathered-expert MoE combine for FP8 (plugin v0.30.0, in spirit of Qwen3.5/3.6 MoE work)."
+        },
+        {
+          "id": "P5.2",
+          "desc": "Pre-register throughput protocol (mirroring PR seeds 301-303) before/after each lever for attribution."
+        },
+        {
+          "id": "P5.3",
+          "desc": "Tune decode bucketing. Treat higher TP / expert-parallel as a MEASURED decision gated on P0.5 all2all bandwidth (EP MoE = all2all dispatch/combine over interconnect), not a default lever; expect higher TP/EP than PR's TP4 Gaudi 3 only if measured all2all supports it."
+        }
+      ],
+      "exit_criteria": [
+        "Documented cost-per-token curve on Gaudi 2 across concurrency 1->target with identified saturation point."
+      ]
+    },
+    {
+      "id": "P6",
+      "title": "Feature parity (deferrable, product-driven)",
+      "goal": "Optional capabilities beyond text-only language serving.",
+      "depends_on": [
+        "P5"
+      ],
+      "deferred": true,
+      "tasks": [
+        {
+          "id": "P6.1",
+          "desc": "MTP speculative decoding: implement HPU MTP drafter in hpu_model_runner.py (only ngram/eagle/medusa exist) or accept dropped mtp.* head."
+        },
+        {
+          "id": "P6.2",
+          "desc": "Vision tower: implement ForConditionalGeneration vision stack if multimodal required (PR excluded it)."
+        },
+        {
+          "id": "P6.3",
+          "desc": "Enable prefix caching + regression coverage after P2.1."
+        }
+      ],
+      "exit_criteria": [
+        "Per-feature: not required for text-only serving enablement."
+      ]
+    }
+  ],
+  "risks": [
+    {
+      "id": "R1",
+      "desc": "Gaudi 2 FP8 MME throughput lower than Gaudi 3 (unverified; measure in P0.2).",
+      "probability": "medium",
+      "impact": "medium",
+      "mitigation": "P0.2 micro-benchmark; treat as perf not feasibility."
+    },
+    {
+      "id": "R2",
+      "desc": "Gaudi 2 HBM (96GB/2.45TB/s) pressures eager sparse-MoE workspace + QSA side caches.",
+      "probability": "high",
+      "impact": "high",
+      "mitigation": "P2.1 block-managed side caches; lower max-model-len/memory-util."
+    },
+    {
+      "id": "R3",
+      "desc": "Sparse top-k not graph-capturable even as single CustomOp (compiler-layer control-flow limit).",
+      "probability": "medium-high",
+      "impact": "medium",
+      "mitigation": "Hybrid compiled+eager for QSA region only."
+    },
+    {
+      "id": "R4",
+      "desc": "#1733 low-batch MoE slowness on Gaudi 2 dominates end-to-end throughput.",
+      "probability": "medium",
+      "impact": "high",
+      "mitigation": "P5.1 gathered-expert combine; higher concurrency; market for high-concurrency only."
+    },
+    {
+      "id": "R5",
+      "desc": "No public Intel roadmap for remaining primitives -> P3 is on you (SDK/CustomOp).",
+      "probability": "confirmed",
+      "impact": "medium",
+      "mitigation": "Use TPC SDK + PyTorch CustomOp API contract."
+    },
+    {
+      "id": "R6",
+      "desc": "Expert-parallel MoE feasibility hinges on HCCL all2all bandwidth on Gaudi 2 interconnect (primitive exists; throughput unverified). Docs flag collectives/congestion as config-sensitive.",
+      "probability": "medium",
+      "impact": "medium-high",
+      "mitigation": "P0.5 benchmark all2all/allgather; fall back to pure TP (allreduce/allgather only) if all2all is weak.",
+      "source": "HCCL index (NCCL emulation layer, collectives incl. all2all); primitives table page 404 under 'latest' - per-primitive caveats unverified"
+    }
+  ],
+  "provenance": {
+    "evidence_grounded": [
+      "PR #1829 scope/limitations/failure sites",
+      "#1734 resolution via upstream pin c05d75a",
+      "PR #1843 mitigations (DS=0 recipe, flat index_copy_ rewrite)",
+      "Plugin v0.24.0/v0.30.0 release notes (TPC-native causal_conv1d; FP8/INC stability; gathered-expert MoE combine)",
+      "Software Suite / TPC SDK kernel-authoring description",
+      "PyTorch CustomOp API contract incl. single-kernel + custom_op namespace limits",
+      "Gaudi 2 FP8 E4M3/E5M2 support; Gaudi 2 96GB/2.45TB/s; Gaudi 3 128GB/3.7TB/s/1.8PFlops FP8",
+      "HCCL = Gaudi's NCCL emulation layer, includes Supported Collective Primitives + Testing/Benchmarking (index). Collectives incl. allreduce/allgather/reducescatter/all2all corroborated via search snippets."
+    ],
+    "author_inference_flagged": [
+      "P3->P4 dependency ordering (single-kernel + namespace gate compile capture) - reading of contract, not stated by Intel",
+      "Residual Gaudi 2 FP8 throughput concern (existence confirmed; throughput unverified)",
+      "'P4 pin check before heavy P3' ordering = judgment on leverage, not a source claim",
+      "HCCL Supported_Primitives authoritative table returned 404 under 'latest'; all2all-existence is corroborated by secondary search snippets, NOT the primitives table itself. Per-primitive dtype/topology caveats UNVERIFIED. Re-read on the v1.24.2 path if it matters to P5."
+    ]
+  }
+}
